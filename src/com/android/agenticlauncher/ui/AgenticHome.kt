@@ -14,6 +14,7 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.ImeAction
@@ -32,14 +33,13 @@ import com.android.agenticlauncher.*
  * On completion, renders the server-driven UI if available,
  * otherwise shows the text response.
  */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AgenticHome(
     viewModel: LauncherViewModel,
     onAppLaunch: (String) -> Unit
 ) {
     val uiState by viewModel.uiState.collectAsState()
-    var inputText by remember { mutableStateOf("") }
+    var inputText by rememberSaveable { mutableStateOf("") }
 
     Scaffold(
         bottomBar = {
@@ -75,16 +75,16 @@ fun AgenticHome(
             }
 
             // Error
-            if (uiState.error != null) {
+            uiState.error?.let { error ->
                 item {
-                    ErrorCard(uiState.error!!)
+                    ErrorCard(error)
                 }
             }
 
             // Active tool call indicator
-            if (uiState.activeToolCall != null) {
+            uiState.activeToolCall?.let { toolCall ->
                 item {
-                    ToolCallIndicator(uiState.activeToolCall!!)
+                    ToolCallIndicator(toolCall)
                 }
             }
 
@@ -96,8 +96,8 @@ fun AgenticHome(
             }
 
             // Server-driven UI elements
-            if (uiState.serverUi != null) {
-                items(uiState.serverUi!!) { element ->
+            uiState.serverUi?.let { elements ->
+                items(elements) { element ->
                     ServerUiElement(
                         element = element,
                         onAction = { action -> viewModel.executeAction(action) }

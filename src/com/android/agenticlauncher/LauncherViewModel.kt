@@ -9,16 +9,15 @@ package com.android.agenticlauncher
 import android.app.Application
 import android.llm.LlmManager
 import android.llm.LlmRequest
-import android.content.pm.mcp.McpServerInfo
 import androidx.lifecycle.AndroidViewModel
-import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.update
 import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
+import java.util.Collections
 import java.util.concurrent.Executors
 
 /**
@@ -34,12 +33,13 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
 
     private val executor = Executors.newSingleThreadExecutor()
 
-    // UI state
+    // UI state — all mutations use _uiState.update{} for atomicity
     private val _uiState = MutableStateFlow(LauncherUiState())
     val uiState: StateFlow<LauncherUiState> = _uiState.asStateFlow()
 
-    // Conversation history for multi-turn
-    private val conversationHistory = mutableListOf<ConversationMessage>()
+    // Conversation history for multi-turn (thread-safe)
+    private val conversationHistory: MutableList<ConversationMessage> =
+        Collections.synchronizedList(mutableListOf())
 
     // Current session handle for cancellation
     private var currentSession: LlmManager.Session? = null
@@ -48,16 +48,22 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         checkServiceReady()
     }
 
+    override fun onCleared() {
+        super.onCleared()
+        currentSession?.cancel()
+        executor.shutdown()
+    }
+
     private fun checkServiceReady() {
         val ready = llmManager?.isReady == true
         val modelInfo = llmManager?.modelInfo
-        _uiState.value = _uiState.value.copy(
+        _uiState.update { it.copy(
             serviceReady = ready,
             modelInfo = modelInfo,
             availableTools = llmManager?.availableServers
-                ?.flatMap { it.tools.map { t -> t.name } }
+                ?.flatMap { server -> server.tools.map { t -> t.name } }
                 ?: emptyList()
-        )
+        ) }
     }
 
     /**
@@ -65,9 +71,7 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
      */
     fun submitQuery(query: String) {
         if (llmManager == null) {
-            _uiState.value = _uiState.value.copy(
-                error = "LLM service not available"
-            )
+            _uiState.update { it.copy(error = "LLM service not available") }
             return
         }
 
@@ -75,14 +79,14 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         conversationHistory.add(ConversationMessage("user", query))
 
         // Update UI state
-        _uiState.value = _uiState.value.copy(
+        _uiState.update { it.copy(
             isGenerating = true,
             currentQuery = query,
             streamedText = "",
             serverUi = null,
             activeToolCall = null,
             error = null
-        )
+        ) }
 
         // Build the request
         val request = LlmRequest.Builder(query)
@@ -97,29 +101,24 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         currentSession = llmManager.submit(request, executor, object : LlmManager.Callback() {
 
             override fun onToken(token: String) {
-                val current = _uiState.value
-                _uiState.value = current.copy(
-                    streamedText = current.streamedText + token
-                )
+                _uiState.update { it.copy(
+                    streamedText = it.streamedText + token
+                ) }
             }
 
             override fun onToolCall(toolName: String, argumentsJson: String) {
-                _uiState.value = _uiState.value.copy(
+                _uiState.update { it.copy(
                     activeToolCall = ToolCallState(toolName, argumentsJson)
-                )
+                ) }
             }
 
             override fun onToolResult(toolName: String, resultJson: String) {
-                _uiState.value = _uiState.value.copy(
-                    activeToolCall = null
-                )
+                _uiState.update { it.copy(activeToolCall = null) }
             }
 
             override fun onServerUi(serverUiJson: String) {
                 val uiElements = parseServerUi(serverUiJson)
-                _uiState.value = _uiState.value.copy(
-                    serverUi = uiElements
-                )
+                _uiState.update { it.copy(serverUi = uiElements) }
             }
 
             override fun onComplete(fullResponse: String) {
@@ -127,67 +126,58 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
                     ConversationMessage("assistant", fullResponse)
                 )
 
-                // Try to parse server UI from the full response if not
-                // already received via onServerUi
-                val current = _uiState.value
-                val ui = current.serverUi ?: parseServerUiFromText(fullResponse)
-
-                _uiState.value = current.copy(
-                    isGenerating = false,
-                    streamedText = fullResponse,
-                    serverUi = ui,
-                    activeToolCall = null
-                )
+                _uiState.update { current ->
+                    val ui = current.serverUi ?: parseServerUiFromText(fullResponse)
+                    current.copy(
+                        isGenerating = false,
+                        streamedText = fullResponse,
+                        serverUi = ui,
+                        activeToolCall = null
+                    )
+                }
                 currentSession = null
             }
 
             override fun onError(errorCode: Int, message: String) {
-                _uiState.value = _uiState.value.copy(
+                _uiState.update { it.copy(
                     isGenerating = false,
                     error = "Error ($errorCode): $message",
                     activeToolCall = null
-                )
+                ) }
                 currentSession = null
             }
         })
     }
 
-    /**
-     * Cancel the current generation.
-     */
     fun cancel() {
         currentSession?.cancel()
-        _uiState.value = _uiState.value.copy(
+        _uiState.update { it.copy(
             isGenerating = false,
             activeToolCall = null
-        )
+        ) }
         currentSession = null
     }
 
-    /**
-     * Execute an action from a server UI element (e.g., user taps a button
-     * that triggers a tool call).
-     */
     fun executeAction(action: UiAction) {
         submitQuery("Execute: ${action.label} (tool: ${action.tool}, args: ${action.argsJson})")
     }
 
-    /**
-     * Clear conversation and reset.
-     */
     fun clearConversation() {
         conversationHistory.clear()
-        _uiState.value = LauncherUiState(
-            serviceReady = llmManager?.isReady == true,
-            modelInfo = llmManager?.modelInfo
-        )
+        _uiState.update {
+            LauncherUiState(
+                serviceReady = llmManager?.isReady == true,
+                modelInfo = llmManager?.modelInfo
+            )
+        }
     }
 
     private fun buildConversationJson(): String? {
         if (conversationHistory.isEmpty()) return null
         val arr = JSONArray()
-        // Keep last 10 messages to stay within context
-        val recent = conversationHistory.takeLast(10)
+        val recent = synchronized(conversationHistory) {
+            conversationHistory.takeLast(10)
+        }
         for (msg in recent) {
             val obj = JSONObject()
             obj.put("role", msg.role)
@@ -201,19 +191,6 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
     // Server UI JSON parsing
     // ------------------------------------------------------------------
 
-    /**
-     * Parse structured UI JSON.
-     *
-     * Expected format:
-     * {
-     *   "ui": [
-     *     {"type": "card", "title": "...", "content": "...", "actions": [...]},
-     *     {"type": "list", "title": "...", "items": [...]},
-     *     {"type": "text", "content": "..."},
-     *     {"type": "action", "label": "...", "tool": "...", "args": {...}}
-     *   ]
-     * }
-     */
     private fun parseServerUi(json: String): List<UiElement> {
         return try {
             val root = JSONObject(json)
@@ -225,54 +202,65 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
     }
 
     private fun parseServerUiFromText(text: String): List<UiElement>? {
-        // Try to find JSON with "ui" key in the response text
-        val jsonStart = text.indexOf("{")
-        val jsonEnd = text.lastIndexOf("}")
-        if (jsonStart < 0 || jsonEnd <= jsonStart) return null
+        // Look specifically for {"ui": pattern
+        val marker = "\"ui\""
+        val markerIdx = text.indexOf(marker)
+        if (markerIdx < 0) return null
 
-        return try {
-            val candidate = text.substring(jsonStart, jsonEnd + 1)
-            val root = JSONObject(candidate)
-            if (!root.has("ui")) return null
-            parseUiArray(root.getJSONArray("ui"))
-        } catch (e: JSONException) {
-            null
+        // Find the enclosing { before "ui"
+        val braceStart = text.lastIndexOf('{', markerIdx)
+        if (braceStart < 0) return null
+
+        // Try progressively larger substrings until JSON parses
+        for (end in braceStart + 2..text.length) {
+            if (text[end - 1] != '}') continue
+            try {
+                val candidate = text.substring(braceStart, end)
+                val root = JSONObject(candidate)
+                if (!root.has("ui")) continue
+                return parseUiArray(root.getJSONArray("ui"))
+            } catch (e: JSONException) {
+                // Not valid JSON yet, try longer
+            }
         }
+        return null
     }
 
     private fun parseUiArray(array: JSONArray): List<UiElement> {
         val elements = mutableListOf<UiElement>()
         for (i in 0 until array.length()) {
-            val obj = array.getJSONObject(i)
-            val type = obj.optString("type", "text")
-            when (type) {
-                "card" -> elements.add(
-                    UiElement.Card(
-                        title = obj.optString("title", ""),
-                        content = obj.optString("content", ""),
-                        actions = parseActions(obj.optJSONArray("actions"))
-                    )
-                )
-                "list" -> elements.add(
-                    UiElement.ItemList(
-                        title = obj.optString("title", ""),
-                        items = parseStringArray(obj.optJSONArray("items"))
-                    )
-                )
-                "text" -> elements.add(
-                    UiElement.Text(
-                        content = obj.optString("content", "")
-                    )
-                )
-                "action" -> elements.add(
-                    UiElement.ActionButton(
-                        action = UiAction(
-                            label = obj.optString("label", ""),
-                            tool = obj.optString("tool", ""),
-                            argsJson = obj.optJSONObject("args")?.toString() ?: "{}"
+            try {
+                val obj = array.getJSONObject(i)
+                val type = obj.optString("type", "text")
+                when (type) {
+                    "card" -> elements.add(
+                        UiElement.Card(
+                            title = obj.optString("title", ""),
+                            content = obj.optString("content", ""),
+                            actions = parseActions(obj.optJSONArray("actions"))
                         )
                     )
-                )
+                    "list" -> elements.add(
+                        UiElement.ItemList(
+                            title = obj.optString("title", ""),
+                            items = parseStringArray(obj.optJSONArray("items"))
+                        )
+                    )
+                    "text" -> elements.add(
+                        UiElement.Text(content = obj.optString("content", ""))
+                    )
+                    "action" -> elements.add(
+                        UiElement.ActionButton(
+                            action = UiAction(
+                                label = obj.optString("label", ""),
+                                tool = obj.optString("tool", ""),
+                                argsJson = obj.optJSONObject("args")?.toString() ?: "{}"
+                            )
+                        )
+                    )
+                }
+            } catch (e: JSONException) {
+                // Skip malformed elements, don't discard the whole list
             }
         }
         return elements
@@ -282,14 +270,16 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         if (array == null) return emptyList()
         val actions = mutableListOf<UiAction>()
         for (i in 0 until array.length()) {
-            val obj = array.getJSONObject(i)
-            actions.add(
-                UiAction(
+            try {
+                val obj = array.getJSONObject(i)
+                actions.add(UiAction(
                     label = obj.optString("label", ""),
                     tool = obj.optString("tool", ""),
                     argsJson = obj.optJSONObject("args")?.toString() ?: "{}"
-                )
-            )
+                ))
+            } catch (e: JSONException) {
+                // skip
+            }
         }
         return actions
     }

@@ -21,6 +21,8 @@ android_app {
         "androidx.compose.foundation_foundation",
         "androidx.compose.runtime_runtime",
         "androidx.lifecycle_lifecycle-viewmodel-compose",
+        "androidx.lifecycle_lifecycle-viewmodel-ktx",
+        "kotlinx-coroutines-android",
     ],
 
     // System app — installed in /system/priv-app/
