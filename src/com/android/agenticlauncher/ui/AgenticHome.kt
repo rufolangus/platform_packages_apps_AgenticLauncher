@@ -6,32 +6,36 @@
 
 package com.android.agenticlauncher.ui
 
-import androidx.compose.animation.*
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.android.agenticlauncher.*
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
- * Main composable for the Agentic Launcher home screen.
+ * Main composable for the Agentic Launcher.
  *
- * Layout:
- * - Top: streaming response area / server-driven UI cards
- * - Bottom: input bar with send button
- *
- * When idle, shows a greeting and available tool count.
- * During generation, shows streamed tokens and tool call activity.
- * On completion, renders the server-driven UI if available,
- * otherwise shows the text response.
+ * Two screens:
+ * - HOME: conversation view with input bar
+ * - HISTORY: list of past sessions with resume/delete/clear
  */
 @Composable
 fun AgenticHome(
@@ -39,9 +43,31 @@ fun AgenticHome(
     onAppLaunch: (String) -> Unit
 ) {
     val uiState by viewModel.uiState.collectAsState()
+
+    when (uiState.currentScreen) {
+        Screen.HOME -> HomeScreen(viewModel, uiState)
+        Screen.HISTORY -> HistoryScreen(viewModel, uiState)
+    }
+}
+
+// ------------------------------------------------------------------
+// Home Screen
+// ------------------------------------------------------------------
+
+@Composable
+private fun HomeScreen(viewModel: LauncherViewModel, uiState: LauncherUiState) {
     var inputText by rememberSaveable { mutableStateOf("") }
 
     Scaffold(
+        topBar = {
+            HomeTopBar(
+                hasContent = uiState.streamedText.isNotEmpty()
+                        || uiState.serverUi != null,
+                onHistory = { viewModel.navigateTo(Screen.HISTORY) },
+                onNewChat = { viewModel.startNewConversation() },
+                onClear = { viewModel.clearConversation() }
+            )
+        },
         bottomBar = {
             InputBar(
                 text = inputText,
@@ -66,36 +92,26 @@ fun AgenticHome(
             verticalArrangement = Arrangement.spacedBy(12.dp),
             contentPadding = PaddingValues(vertical = 16.dp)
         ) {
-            // Greeting / status
+            // Greeting when idle
             if (!uiState.isGenerating && uiState.serverUi == null
                 && uiState.streamedText.isEmpty()) {
-                item {
-                    GreetingCard(uiState)
-                }
+                item { GreetingCard(uiState) }
             }
 
-            // Error
             uiState.error?.let { error ->
-                item {
-                    ErrorCard(error)
-                }
+                item { ErrorCard(error) }
             }
 
-            // Active tool call indicator
             uiState.activeToolCall?.let { toolCall ->
-                item {
-                    ToolCallIndicator(toolCall)
-                }
+                item { ToolCallIndicator(toolCall) }
             }
 
-            // Streamed text (during generation or if no server UI)
             if (uiState.streamedText.isNotEmpty() && uiState.serverUi == null) {
                 item {
                     TextResponseCard(uiState.streamedText, uiState.isGenerating)
                 }
             }
 
-            // Server-driven UI elements
             uiState.serverUi?.let { elements ->
                 items(elements) { element ->
                     ServerUiElement(
@@ -105,6 +121,244 @@ fun AgenticHome(
                 }
             }
         }
+    }
+}
+
+// ------------------------------------------------------------------
+// Home Top Bar
+// ------------------------------------------------------------------
+
+@Composable
+private fun HomeTopBar(
+    hasContent: Boolean,
+    onHistory: () -> Unit,
+    onNewChat: () -> Unit,
+    onClear: () -> Unit
+) {
+    Surface(
+        tonalElevation = 0.dp,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier
+                .padding(horizontal = 8.dp, vertical = 4.dp)
+                .statusBarsPadding(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = onHistory) {
+                Icon(Icons.Default.History, contentDescription = "History")
+            }
+
+            Spacer(modifier = Modifier.weight(1f))
+
+            if (hasContent) {
+                IconButton(onClick = onNewChat) {
+                    Icon(Icons.Default.Add, contentDescription = "New chat")
+                }
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// History Screen
+// ------------------------------------------------------------------
+
+@Composable
+private fun HistoryScreen(viewModel: LauncherViewModel, uiState: LauncherUiState) {
+    var showClearDialog by remember { mutableStateOf(false) }
+
+    Scaffold(
+        topBar = {
+            HistoryTopBar(
+                onBack = { viewModel.navigateTo(Screen.HOME) },
+                onClearAll = { showClearDialog = true },
+                hasItems = uiState.sessions.isNotEmpty()
+            )
+        }
+    ) { padding ->
+        if (uiState.sessions.isEmpty()) {
+            // Empty state
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(padding),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(
+                        Icons.Default.History,
+                        contentDescription = null,
+                        modifier = Modifier.size(48.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            .copy(alpha = 0.5f)
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text(
+                        text = "No conversations yet",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                            .copy(alpha = 0.7f)
+                    )
+                }
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(padding),
+                contentPadding = PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(
+                    items = uiState.sessions,
+                    key = { it.sessionId }
+                ) { session ->
+                    SessionCard(
+                        session = session,
+                        onResume = { viewModel.resumeSession(session.sessionId) },
+                        onDelete = { viewModel.deleteSession(session.sessionId) }
+                    )
+                }
+            }
+        }
+    }
+
+    // Clear all confirmation dialog
+    if (showClearDialog) {
+        AlertDialog(
+            onDismissRequest = { showClearDialog = false },
+            title = { Text("Clear all history?") },
+            text = { Text("This will permanently delete all conversations and cannot be undone.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        viewModel.clearAllSessions()
+                        showClearDialog = false
+                    },
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error
+                    )
+                ) {
+                    Text("Clear all")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+}
+
+@Composable
+private fun HistoryTopBar(
+    onBack: () -> Unit,
+    onClearAll: () -> Unit,
+    hasItems: Boolean
+) {
+    Surface(
+        tonalElevation = 0.dp,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier
+                .padding(horizontal = 8.dp, vertical = 4.dp)
+                .statusBarsPadding(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = onBack) {
+                Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+            }
+            Text(
+                text = "History",
+                style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.weight(1f)
+            )
+            if (hasItems) {
+                IconButton(onClick = onClearAll) {
+                    Icon(
+                        Icons.Default.Delete,
+                        contentDescription = "Clear all",
+                        tint = MaterialTheme.colorScheme.error
+                    )
+                }
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// Session Card
+// ------------------------------------------------------------------
+
+@Composable
+private fun SessionCard(
+    session: SessionInfo,
+    onResume: () -> Unit,
+    onDelete: () -> Unit
+) {
+    var showDeleteDialog by remember { mutableStateOf(false) }
+    val dateFormat = remember { SimpleDateFormat("MMM d, h:mm a", Locale.getDefault()) }
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onResume() }
+    ) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = session.title,
+                    style = MaterialTheme.typography.titleSmall,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "${session.messageCount} messages \u00b7 ${dateFormat.format(Date(session.updatedAt))}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            IconButton(onClick = { showDeleteDialog = true }) {
+                Icon(
+                    Icons.Default.Delete,
+                    contentDescription = "Delete",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+
+    if (showDeleteDialog) {
+        AlertDialog(
+            onDismissRequest = { showDeleteDialog = false },
+            title = { Text("Delete conversation?") },
+            text = { Text("\"${session.title}\" will be permanently deleted.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onDelete()
+                        showDeleteDialog = false
+                    },
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error
+                    )
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 }
 
@@ -193,10 +447,10 @@ fun GreetingCard(state: LauncherUiState) {
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f)
             )
-            if (state.modelInfo != null) {
+            state.modelInfo?.let { info ->
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = state.modelInfo!!,
+                    text = info,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.5f)
                 )
@@ -226,13 +480,11 @@ fun ToolCallIndicator(toolCall: ToolCallState) {
                 strokeWidth = 2.dp
             )
             Spacer(modifier = Modifier.width(12.dp))
-            Column {
-                Text(
-                    text = "Using ${toolCall.toolName}...",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onTertiaryContainer
-                )
-            }
+            Text(
+                text = "Using ${toolCall.toolName}...",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onTertiaryContainer
+            )
         }
     }
 }
@@ -245,10 +497,7 @@ fun ToolCallIndicator(toolCall: ToolCallState) {
 fun TextResponseCard(text: String, isGenerating: Boolean) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp)) {
-            Text(
-                text = text,
-                style = MaterialTheme.typography.bodyLarge
-            )
+            Text(text = text, style = MaterialTheme.typography.bodyLarge)
             if (isGenerating) {
                 Spacer(modifier = Modifier.height(8.dp))
                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
@@ -282,17 +531,8 @@ fun ErrorCard(message: String) {
 // Server-Driven UI Renderer
 // ------------------------------------------------------------------
 
-/**
- * Renders a single server-driven UI element.
- *
- * This is the core of the agentic launcher — the LLM produces structured
- * JSON, and this composable renders it as Material 3 components.
- */
 @Composable
-fun ServerUiElement(
-    element: UiElement,
-    onAction: (UiAction) -> Unit
-) {
+fun ServerUiElement(element: UiElement, onAction: (UiAction) -> Unit) {
     when (element) {
         is UiElement.Card -> ServerCard(element, onAction)
         is UiElement.ItemList -> ServerList(element)
@@ -306,27 +546,17 @@ fun ServerCard(card: UiElement.Card, onAction: (UiAction) -> Unit) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp)) {
             if (card.title.isNotEmpty()) {
-                Text(
-                    text = card.title,
-                    style = MaterialTheme.typography.titleMedium
-                )
+                Text(text = card.title, style = MaterialTheme.typography.titleMedium)
                 Spacer(modifier = Modifier.height(8.dp))
             }
             if (card.content.isNotEmpty()) {
-                Text(
-                    text = card.content,
-                    style = MaterialTheme.typography.bodyMedium
-                )
+                Text(text = card.content, style = MaterialTheme.typography.bodyMedium)
             }
             if (card.actions.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(12.dp))
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     for (action in card.actions) {
-                        FilledTonalButton(
-                            onClick = { onAction(action) }
-                        ) {
+                        FilledTonalButton(onClick = { onAction(action) }) {
                             Text(action.label)
                         }
                     }
@@ -341,10 +571,7 @@ fun ServerList(list: UiElement.ItemList) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp)) {
             if (list.title.isNotEmpty()) {
-                Text(
-                    text = list.title,
-                    style = MaterialTheme.typography.titleMedium
-                )
+                Text(text = list.title, style = MaterialTheme.typography.titleMedium)
                 Spacer(modifier = Modifier.height(8.dp))
             }
             for ((index, item) in list.items.withIndex()) {
@@ -372,10 +599,7 @@ fun ServerText(element: UiElement.Text) {
 
 @Composable
 fun ServerActionButton(action: UiAction, onAction: (UiAction) -> Unit) {
-    Button(
-        onClick = { onAction(action) },
-        modifier = Modifier.fillMaxWidth()
-    ) {
+    Button(onClick = { onAction(action) }, modifier = Modifier.fillMaxWidth()) {
         Text(action.label)
     }
 }

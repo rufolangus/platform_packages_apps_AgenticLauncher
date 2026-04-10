@@ -20,12 +20,6 @@ import org.json.JSONObject
 import java.util.Collections
 import java.util.concurrent.Executors
 
-/**
- * ViewModel for the Agentic Launcher.
- *
- * Manages the conversation state, submits requests to the LLM System Service,
- * and parses server-driven UI responses for the Compose layer to render.
- */
 class LauncherViewModel(application: Application) : AndroidViewModel(application) {
 
     private val llmManager: LlmManager? =
@@ -33,19 +27,20 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
 
     private val executor = Executors.newSingleThreadExecutor()
 
-    // UI state — all mutations use _uiState.update{} for atomicity
     private val _uiState = MutableStateFlow(LauncherUiState())
     val uiState: StateFlow<LauncherUiState> = _uiState.asStateFlow()
 
-    // Conversation history for multi-turn (thread-safe)
     private val conversationHistory: MutableList<ConversationMessage> =
         Collections.synchronizedList(mutableListOf())
 
-    // Current session handle for cancellation
     private var currentSession: LlmManager.Session? = null
+
+    /** Current persistent session ID for multi-turn continuity. */
+    private var activeSessionId: String? = null
 
     init {
         checkServiceReady()
+        loadSessionHistory()
     }
 
     override fun onCleared() {
@@ -66,20 +61,158 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         ) }
     }
 
+    // ------------------------------------------------------------------
+    // Session history
+    // ------------------------------------------------------------------
+
     /**
-     * Submit a user query to the LLM.
+     * Load the list of past sessions from the LLM service.
      */
+    fun loadSessionHistory() {
+        val json = try {
+            llmManager?.let {
+                // listSessions is accessed via the service binder
+                val method = it.javaClass.getMethod("listSessions", Int::class.java)
+                method.invoke(it, 50) as? String
+            }
+        } catch (e: Exception) {
+            null
+        }
+
+        if (json == null) {
+            _uiState.update { it.copy(sessions = emptyList()) }
+            return
+        }
+
+        try {
+            val arr = JSONArray(json)
+            val sessions = (0 until arr.length()).map { i ->
+                val obj = arr.getJSONObject(i)
+                SessionInfo(
+                    sessionId = obj.getString("sessionId"),
+                    title = obj.optString("title", "Untitled"),
+                    updatedAt = obj.getLong("updatedAt"),
+                    messageCount = obj.getInt("messageCount")
+                )
+            }
+            _uiState.update { it.copy(sessions = sessions) }
+        } catch (e: JSONException) {
+            _uiState.update { it.copy(sessions = emptyList()) }
+        }
+    }
+
+    /**
+     * Resume a past session — load its history and continue the conversation.
+     */
+    fun resumeSession(sessionId: String) {
+        activeSessionId = sessionId
+
+        val json = try {
+            llmManager?.let {
+                val method = it.javaClass.getMethod("getSessionHistory", String::class.java)
+                method.invoke(it, sessionId) as? String
+            }
+        } catch (e: Exception) {
+            null
+        }
+
+        // Parse history into conversation messages
+        conversationHistory.clear()
+        if (json != null) {
+            try {
+                val arr = JSONArray(json)
+                for (i in 0 until arr.length()) {
+                    val obj = arr.getJSONObject(i)
+                    conversationHistory.add(ConversationMessage(
+                        role = obj.getString("role"),
+                        content = obj.getString("content")
+                    ))
+                }
+            } catch (e: JSONException) {
+                // start fresh
+            }
+        }
+
+        _uiState.update { it.copy(
+            currentScreen = Screen.HOME,
+            streamedText = "",
+            serverUi = null,
+            error = null,
+            activeToolCall = null
+        ) }
+    }
+
+    /**
+     * Delete a single session.
+     */
+    fun deleteSession(sessionId: String) {
+        try {
+            llmManager?.let {
+                val method = it.javaClass.getMethod("deleteSession", String::class.java)
+                method.invoke(it, sessionId)
+            }
+        } catch (e: Exception) {
+            // ignore
+        }
+
+        // If we just deleted the active session, reset
+        if (sessionId == activeSessionId) {
+            activeSessionId = null
+            conversationHistory.clear()
+        }
+
+        loadSessionHistory()
+    }
+
+    /**
+     * Delete all sessions.
+     */
+    fun clearAllSessions() {
+        try {
+            llmManager?.let {
+                val method = it.javaClass.getMethod("clearAllSessions")
+                method.invoke(it)
+            }
+        } catch (e: Exception) {
+            // ignore
+        }
+
+        activeSessionId = null
+        conversationHistory.clear()
+        loadSessionHistory()
+
+        _uiState.update { it.copy(
+            streamedText = "",
+            serverUi = null,
+            error = null
+        ) }
+    }
+
+    // ------------------------------------------------------------------
+    // Navigation
+    // ------------------------------------------------------------------
+
+    fun navigateTo(screen: Screen) {
+        _uiState.update { it.copy(currentScreen = screen) }
+        if (screen == Screen.HISTORY) {
+            loadSessionHistory()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Conversation
+    // ------------------------------------------------------------------
+
     fun submitQuery(query: String) {
         if (llmManager == null) {
             _uiState.update { it.copy(error = "LLM service not available") }
             return
         }
 
-        // Add user message to history
         conversationHistory.add(ConversationMessage("user", query))
 
-        // Update UI state
         _uiState.update { it.copy(
+            currentScreen = Screen.HOME,
             isGenerating = true,
             currentQuery = query,
             streamedText = "",
@@ -88,16 +221,19 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
             error = null
         ) }
 
-        // Build the request
-        val request = LlmRequest.Builder(query)
+        val builder = LlmRequest.Builder(query)
             .setRequestServerUi(true)
             .enableToolUse(true)
             .setConversationJson(buildConversationJson())
             .setTemperature(0.7f)
             .setMaxTokens(2048)
-            .build()
 
-        // Submit to LLM service
+        // If we have an active session, pass it for continuity
+        // (The service will create a new one if sessionId is null)
+        // activeSessionId?.let { builder.setSessionId(it) }
+
+        val request = builder.build()
+
         currentSession = llmManager.submit(request, executor, object : LlmManager.Callback() {
 
             override fun onToken(token: String) {
@@ -125,6 +261,11 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
                 conversationHistory.add(
                     ConversationMessage("assistant", fullResponse)
                 )
+
+                // Capture the session ID from the session handle
+                currentSession?.let { session ->
+                    activeSessionId = session.id
+                }
 
                 _uiState.update { current ->
                     val ui = current.serverUi ?: parseServerUiFromText(fullResponse)
@@ -163,6 +304,7 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun clearConversation() {
+        activeSessionId = null
         conversationHistory.clear()
         _uiState.update {
             LauncherUiState(
@@ -170,6 +312,18 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
                 modelInfo = llmManager?.modelInfo
             )
         }
+    }
+
+    fun startNewConversation() {
+        activeSessionId = null
+        conversationHistory.clear()
+        _uiState.update { it.copy(
+            currentScreen = Screen.HOME,
+            streamedText = "",
+            serverUi = null,
+            error = null,
+            activeToolCall = null
+        ) }
     }
 
     private fun buildConversationJson(): String? {
@@ -202,16 +356,13 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
     }
 
     private fun parseServerUiFromText(text: String): List<UiElement>? {
-        // Look specifically for {"ui": pattern
         val marker = "\"ui\""
         val markerIdx = text.indexOf(marker)
         if (markerIdx < 0) return null
 
-        // Find the enclosing { before "ui"
         val braceStart = text.lastIndexOf('{', markerIdx)
         if (braceStart < 0) return null
 
-        // Try progressively larger substrings until JSON parses
         for (end in braceStart + 2..text.length) {
             if (text[end - 1] != '}') continue
             try {
@@ -220,7 +371,7 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
                 if (!root.has("ui")) continue
                 return parseUiArray(root.getJSONArray("ui"))
             } catch (e: JSONException) {
-                // Not valid JSON yet, try longer
+                // try longer
             }
         }
         return null
@@ -231,37 +382,28 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         for (i in 0 until array.length()) {
             try {
                 val obj = array.getJSONObject(i)
-                val type = obj.optString("type", "text")
-                when (type) {
-                    "card" -> elements.add(
-                        UiElement.Card(
-                            title = obj.optString("title", ""),
-                            content = obj.optString("content", ""),
-                            actions = parseActions(obj.optJSONArray("actions"))
-                        )
-                    )
-                    "list" -> elements.add(
-                        UiElement.ItemList(
-                            title = obj.optString("title", ""),
-                            items = parseStringArray(obj.optJSONArray("items"))
-                        )
-                    )
+                when (obj.optString("type", "text")) {
+                    "card" -> elements.add(UiElement.Card(
+                        title = obj.optString("title", ""),
+                        content = obj.optString("content", ""),
+                        actions = parseActions(obj.optJSONArray("actions"))
+                    ))
+                    "list" -> elements.add(UiElement.ItemList(
+                        title = obj.optString("title", ""),
+                        items = parseStringArray(obj.optJSONArray("items"))
+                    ))
                     "text" -> elements.add(
                         UiElement.Text(content = obj.optString("content", ""))
                     )
-                    "action" -> elements.add(
-                        UiElement.ActionButton(
-                            action = UiAction(
-                                label = obj.optString("label", ""),
-                                tool = obj.optString("tool", ""),
-                                argsJson = obj.optJSONObject("args")?.toString() ?: "{}"
-                            )
+                    "action" -> elements.add(UiElement.ActionButton(
+                        action = UiAction(
+                            label = obj.optString("label", ""),
+                            tool = obj.optString("tool", ""),
+                            argsJson = obj.optJSONObject("args")?.toString() ?: "{}"
                         )
-                    )
+                    ))
                 }
-            } catch (e: JSONException) {
-                // Skip malformed elements, don't discard the whole list
-            }
+            } catch (e: JSONException) { /* skip */ }
         }
         return elements
     }
@@ -277,9 +419,7 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
                     tool = obj.optString("tool", ""),
                     argsJson = obj.optJSONObject("args")?.toString() ?: "{}"
                 ))
-            } catch (e: JSONException) {
-                // skip
-            }
+            } catch (e: JSONException) { /* skip */ }
         }
         return actions
     }
@@ -294,7 +434,10 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
 // Data classes
 // ------------------------------------------------------------------
 
+enum class Screen { HOME, HISTORY }
+
 data class LauncherUiState(
+    val currentScreen: Screen = Screen.HOME,
     val serviceReady: Boolean = false,
     val modelInfo: String? = null,
     val isGenerating: Boolean = false,
@@ -303,7 +446,15 @@ data class LauncherUiState(
     val serverUi: List<UiElement>? = null,
     val activeToolCall: ToolCallState? = null,
     val error: String? = null,
-    val availableTools: List<String> = emptyList()
+    val availableTools: List<String> = emptyList(),
+    val sessions: List<SessionInfo> = emptyList()
+)
+
+data class SessionInfo(
+    val sessionId: String,
+    val title: String,
+    val updatedAt: Long,
+    val messageCount: Int
 )
 
 data class ToolCallState(
