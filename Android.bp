@@ -1,0 +1,37 @@
+// Copyright (C) 2024 The AAOSP Project
+//
+// Licensed under the Apache License, Version 2.0
+
+android_app {
+    name: "AgenticLauncher",
+
+    srcs: ["src/**/*.java", "src/**/*.kt"],
+
+    resource_dirs: ["res"],
+
+    manifest: "AndroidManifest.xml",
+
+    static_libs: [
+        "androidx.core_core-ktx",
+        "androidx.appcompat_appcompat",
+        "androidx.activity_activity-compose",
+        "androidx.compose.material3_material3",
+        "androidx.compose.ui_ui",
+        "androidx.compose.ui_ui-tooling-preview",
+        "androidx.compose.foundation_foundation",
+        "androidx.compose.runtime_runtime",
+        "androidx.lifecycle_lifecycle-viewmodel-compose",
+    ],
+
+    // System app — installed in /system/priv-app/
+    privileged: true,
+    platform_apis: true,
+    certificate: "platform",
+
+    optimize: {
+        enabled: true,
+        proguard_flags_files: ["proguard-rules.pro"],
+    },
+
+    kotlincflags: ["-Xjvm-default=all"],
+}
