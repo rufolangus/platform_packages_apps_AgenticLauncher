@@ -392,11 +392,11 @@ fun InputBar(
                 modifier = Modifier.weight(1f),
                 placeholder = {
                     Text(
-                        if (serviceReady) "Ask anything..."
+                        if (true) "Ask anything..."
                         else "LLM loading..."
                     )
                 },
-                enabled = serviceReady && !isGenerating,
+                enabled = !isGenerating,  // Allow input even without model
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                 keyboardActions = KeyboardActions(onSend = { onSubmit() })
@@ -411,7 +411,7 @@ fun InputBar(
             } else {
                 Button(
                     onClick = onSubmit,
-                    enabled = serviceReady && text.isNotBlank()
+                    enabled = text.isNotBlank()  // Allow send even without model
                 ) {
                     Text("Send")
                 }

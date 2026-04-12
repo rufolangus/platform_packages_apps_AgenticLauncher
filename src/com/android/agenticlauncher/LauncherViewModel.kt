@@ -55,9 +55,11 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         _uiState.update { it.copy(
             serviceReady = ready,
             modelInfo = modelInfo,
-            availableTools = llmManager?.availableServers
-                ?.flatMap { server -> server.tools.map { t -> t.name } }
-                ?: emptyList()
+            availableTools = try {
+                val json = llmManager?.availableServers ?: "[]"
+                val arr = org.json.JSONArray(json)
+                (0 until arr.length()).map { arr.optString(it, "") }
+            } catch (e: Exception) { emptyList() }
         ) }
     }
 

@@ -1,8 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!--
-    Privileged permission allowlist for the Agentic Launcher.
-    Install to: /etc/permissions/privapp-permissions-agenticlauncher.xml
--->
 <permissions>
     <privapp-permissions package="com.android.agenticlauncher">
         <permission name="android.permission.SUBMIT_LLM_REQUEST"/>
