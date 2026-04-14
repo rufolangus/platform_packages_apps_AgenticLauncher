@@ -9,6 +9,7 @@ package com.android.agenticlauncher
 import android.app.Application
 import android.llm.LlmManager
 import android.llm.LlmRequest
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -221,6 +222,16 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
             _uiState.update { it.copy(error = "LLM service not available") }
             return
         }
+        // v0.5.1: if the cached readiness is false, re-poll before
+        // giving up. The 3B model takes ~15s to mmap on cold boot; if
+        // the user opens the launcher during that window, the init-time
+        // checkServiceReady() caches `false` and the UI is stuck on
+        // "no model loaded" forever. Re-querying on submit is
+        // self-correcting — if ready now, we proceed; if still not
+        // ready, the submit fails with the service's own error.
+        if (_uiState.value.serviceReady != true) {
+            checkServiceReady()
+        }
 
         val userMsg = ConversationMessage("user", query)
         conversationHistory.add(userMsg)
@@ -409,6 +420,14 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun cancel() {
+        // v0.5.1 diagnostic: phantom cancel() calls have been observed
+        // ~283ms after submit, killing the chain on the iter-1 boundary
+        // before the final prose turn. Suspected IME lifecycle / touch
+        // target overlap. Log a stack trace every time cancel() fires
+        // so we can identify the caller. Remove the Throwable allocation
+        // in v0.5.2 once the root cause is fixed; keep the log line.
+        Log.w("AgenticLauncher", "cancel() called (isGenerating="
+                + _uiState.value.isGenerating + ")", Throwable("cancel() stack"))
         currentSession?.cancel()
         _uiState.update { it.copy(
             isGenerating = false,
