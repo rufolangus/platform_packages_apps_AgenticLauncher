@@ -22,6 +22,9 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.core.graphics.drawable.toBitmap
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -63,6 +66,7 @@ private fun HomeScreen(viewModel: LauncherViewModel, uiState: LauncherUiState) {
             HomeTopBar(
                 hasContent = uiState.streamedText.isNotEmpty()
                         || uiState.serverUi != null,
+                hasHistory = uiState.sessions.isNotEmpty(),
                 onHistory = { viewModel.navigateTo(Screen.HISTORY) },
                 onNewChat = { viewModel.startNewConversation() },
                 onClear = { viewModel.clearConversation() }
@@ -106,6 +110,15 @@ private fun HomeScreen(viewModel: LauncherViewModel, uiState: LauncherUiState) {
                 item { ToolCallIndicator(toolCall) }
             }
 
+            // Proof-of-life between submit and first token / tool event.
+            if (uiState.isGenerating
+                    && uiState.streamedText.isEmpty()
+                    && uiState.activeToolCall == null
+                    && uiState.serverUi == null
+                    && uiState.error == null) {
+                item { ThinkingCard() }
+            }
+
             if (uiState.streamedText.isNotEmpty() && uiState.serverUi == null) {
                 item {
                     TextResponseCard(uiState.streamedText, uiState.isGenerating)
@@ -131,6 +144,7 @@ private fun HomeScreen(viewModel: LauncherViewModel, uiState: LauncherUiState) {
 @Composable
 private fun HomeTopBar(
     hasContent: Boolean,
+    hasHistory: Boolean,
     onHistory: () -> Unit,
     onNewChat: () -> Unit,
     onClear: () -> Unit
@@ -145,8 +159,13 @@ private fun HomeTopBar(
                 .statusBarsPadding(),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            IconButton(onClick = onHistory) {
-                Icon(Icons.Default.History, contentDescription = "History")
+            // Only show the History button when there's actually a history
+            // to view. This avoids accidental top-left taps navigating to
+            // an empty screen during the user's first few interactions.
+            if (hasHistory) {
+                IconButton(onClick = onHistory) {
+                    Icon(Icons.Default.History, contentDescription = "History")
+                }
             }
 
             Spacer(modifier = Modifier.weight(1f))
@@ -386,16 +405,21 @@ fun InputBar(
                 .imePadding(),
             verticalAlignment = Alignment.CenterVertically
         ) {
+            // Auto-focus on first appearance so the soft keyboard targets
+            // this field. Without it, on Cuttlefish keystrokes can land on
+            // whatever has stale focus (e.g. the History icon button) and
+            // trigger nav. requestFocus() once when isGenerating is false.
+            val focusRequester = remember { androidx.compose.ui.focus.FocusRequester() }
+            LaunchedEffect(Unit) {
+                runCatching { focusRequester.requestFocus() }
+            }
             OutlinedTextField(
                 value = text,
                 onValueChange = onTextChange,
-                modifier = Modifier.weight(1f),
-                placeholder = {
-                    Text(
-                        if (true) "Ask anything..."
-                        else "LLM loading..."
-                    )
-                },
+                modifier = Modifier
+                    .weight(1f)
+                    .focusRequester(focusRequester),
+                placeholder = { Text("Ask anything...") },
                 enabled = !isGenerating,  // Allow input even without model
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
@@ -465,10 +489,68 @@ fun GreetingCard(state: LauncherUiState) {
 
 @Composable
 fun ToolCallIndicator(toolCall: ToolCallState) {
+    val statusText = when (toolCall.status) {
+        1 /* COMPLETED */ -> "✓ ${toolCall.appLabel} · ${toolCall.toolName} · ${toolCall.durationMs} ms"
+        2 /* FAILED    */ -> "⚠ ${toolCall.appLabel} · ${toolCall.toolName} failed"
+        else /* STARTED */ -> "Asking ${toolCall.appLabel} · ${toolCall.toolName}…"
+    }
+    val container = when (toolCall.status) {
+        2 -> MaterialTheme.colorScheme.errorContainer
+        else -> MaterialTheme.colorScheme.tertiaryContainer
+    }
+    val onContainer = when (toolCall.status) {
+        2 -> MaterialTheme.colorScheme.onErrorContainer
+        else -> MaterialTheme.colorScheme.onTertiaryContainer
+    }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = container)
+    ) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // App icon — the attribution surface. The user always sees
+            // which app is being asked.
+            toolCall.appIcon?.let { drawable ->
+                androidx.compose.foundation.Image(
+                    painter = androidx.compose.ui.graphics.painter.BitmapPainter(
+                        drawable.toBitmap().asImageBitmap()
+                    ),
+                    contentDescription = toolCall.appLabel,
+                    modifier = Modifier.size(28.dp)
+                )
+                Spacer(modifier = Modifier.width(12.dp))
+            } ?: run {
+                if (toolCall.status == 0) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        strokeWidth = 2.dp
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
+                }
+            }
+            Text(
+                text = statusText,
+                style = MaterialTheme.typography.bodyMedium,
+                color = onContainer
+            )
+        }
+    }
+}
+
+/**
+ * Shown between the moment the user submits and the first token (or
+ * tool-call event) arrives. Without this the chat surface goes blank,
+ * which reads as "the OS hung." The animated ellipsis is the proof of
+ * life.
+ */
+@Composable
+fun ThinkingCard() {
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.tertiaryContainer
+            containerColor = MaterialTheme.colorScheme.surfaceVariant
         )
     ) {
         Row(
@@ -476,14 +558,14 @@ fun ToolCallIndicator(toolCall: ToolCallState) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             CircularProgressIndicator(
-                modifier = Modifier.size(20.dp),
+                modifier = Modifier.size(18.dp),
                 strokeWidth = 2.dp
             )
             Spacer(modifier = Modifier.width(12.dp))
             Text(
-                text = "Using ${toolCall.toolName}...",
+                text = "Thinking…",
                 style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onTertiaryContainer
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
     }

@@ -55,10 +55,20 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         _uiState.update { it.copy(
             serviceReady = ready,
             modelInfo = modelInfo,
+            // ILlmService.getAvailableServers() returns the Java toString()
+            // of List<McpServerInfo> — i.e.
+            //   [McpServerInfo{name=..., packageName=..., tools=N, resources=M}, ...]
+            // Build a synthetic list with one entry per tool so the UI count
+            // matches what the LLM sees in its <tools> prompt block.
             availableTools = try {
-                val json = llmManager?.availableServers ?: "[]"
-                val arr = org.json.JSONArray(json)
-                (0 until arr.length()).map { arr.optString(it, "") }
+                val raw = llmManager?.availableServers ?: ""
+                val toolsRegex = Regex("tools=(\\d+)")
+                toolsRegex.findAll(raw)
+                    .flatMap { match ->
+                        val n = match.groupValues[1].toIntOrNull() ?: 0
+                        (1..n).asSequence().map { "tool" }
+                    }
+                    .toList()
             } catch (e: Exception) { emptyList() }
         ) }
     }
@@ -244,14 +254,49 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
                 ) }
             }
 
-            override fun onToolCall(toolName: String, argumentsJson: String) {
+            override fun onToolCall(info: android.content.pm.mcp.McpToolCallInfo) {
+                // Look up the owning app's icon + label so the launcher
+                // can render attribution alongside the tool name. The
+                // user always sees which app is being asked to do what.
+                val pm = getApplication<android.app.Application>().packageManager
+                val (appLabel, appIcon) = try {
+                    val ai = pm.getApplicationInfo(info.packageName, 0)
+                    pm.getApplicationLabel(ai).toString() to pm.getApplicationIcon(ai)
+                } catch (e: Exception) { info.packageName to null }
                 _uiState.update { it.copy(
-                    activeToolCall = ToolCallState(toolName, argumentsJson)
+                    activeToolCall = ToolCallState(
+                        toolName = info.toolName,
+                        packageName = info.packageName,
+                        appLabel = appLabel,
+                        appIcon = appIcon,
+                        argumentsJson = info.argumentsJson,
+                        status = info.status,
+                        durationMs = info.durationMillis
+                    )
                 ) }
             }
 
-            override fun onToolResult(toolName: String, resultJson: String) {
-                _uiState.update { it.copy(activeToolCall = null) }
+            override fun onToolResult(info: android.content.pm.mcp.McpToolCallInfo) {
+                // Keep the card on screen briefly with the final status
+                // so the user sees "✓ Searched contacts in 240 ms"
+                // before it fades. The viewmodel clears it when the
+                // next stream chunk arrives.
+                val pm = getApplication<android.app.Application>().packageManager
+                val (appLabel, appIcon) = try {
+                    val ai = pm.getApplicationInfo(info.packageName, 0)
+                    pm.getApplicationLabel(ai).toString() to pm.getApplicationIcon(ai)
+                } catch (e: Exception) { info.packageName to null }
+                _uiState.update { it.copy(
+                    activeToolCall = ToolCallState(
+                        toolName = info.toolName,
+                        packageName = info.packageName,
+                        appLabel = appLabel,
+                        appIcon = appIcon,
+                        argumentsJson = info.argumentsJson,
+                        status = info.status,
+                        durationMs = info.durationMillis
+                    )
+                ) }
             }
 
             override fun onServerUi(serverUiJson: String) {
@@ -461,7 +506,12 @@ data class SessionInfo(
 
 data class ToolCallState(
     val toolName: String,
-    val argumentsJson: String
+    val packageName: String,
+    val appLabel: String,
+    val appIcon: android.graphics.drawable.Drawable?,
+    val argumentsJson: String,
+    val status: Int,    // McpToolCallInfo.STATUS_*
+    val durationMs: Int // -1 while in-flight
 )
 
 data class ConversationMessage(
