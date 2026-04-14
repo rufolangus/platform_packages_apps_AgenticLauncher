@@ -148,6 +148,7 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         _uiState.update { it.copy(
             currentScreen = Screen.HOME,
             streamedText = "",
+            messages = conversationHistory.toList(),
             serverUi = null,
             error = null,
             activeToolCall = null
@@ -221,13 +222,15 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
             return
         }
 
-        conversationHistory.add(ConversationMessage("user", query))
+        val userMsg = ConversationMessage("user", query)
+        conversationHistory.add(userMsg)
 
         _uiState.update { it.copy(
             currentScreen = Screen.HOME,
             isGenerating = true,
             currentQuery = query,
             streamedText = "",
+            messages = it.messages + userMsg,
             serverUi = null,
             activeToolCall = null,
             error = null
@@ -240,9 +243,12 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
             .setTemperature(0.7f)
             .setMaxTokens(2048)
 
-        // If we have an active session, pass it for continuity
-        // (The service will create a new one if sessionId is null)
-        // activeSessionId?.let { builder.setSessionId(it) }
+        // If we have an active session, pass it for continuity.
+        // The service creates a new one when sessionId is null;
+        // startNewConversation() / clearConversation() null this out
+        // AND call endSession on the old id so SESSION-scoped consent
+        // grants are cleared before a fresh turn.
+        activeSessionId?.let { builder.setSessionId(it) }
 
         val request = builder.build()
 
@@ -255,6 +261,16 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
             }
 
             override fun onToolCall(info: android.content.pm.mcp.McpToolCallInfo) {
+                // Built-in framework tool (v0.5): launch_app has
+                // packageName=="android" and is a framework-provided
+                // capability with no MCP service. The dispatcher fires
+                // STARTED so we can actually launch the app, then
+                // synthesizes COMPLETED immediately. Fire-and-forget.
+                if ("android" == info.packageName
+                        && "launch_app" == info.toolName
+                        && info.status == 0 /* STATUS_STARTED */) {
+                    handleBuiltinLaunchApp(info.argumentsJson)
+                }
                 // Look up the owning app's icon + label so the launcher
                 // can render attribution alongside the tool name. The
                 // user always sees which app is being asked to do what.
@@ -263,16 +279,30 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
                     val ai = pm.getApplicationInfo(info.packageName, 0)
                     pm.getApplicationLabel(ai).toString() to pm.getApplicationIcon(ai)
                 } catch (e: Exception) { info.packageName to null }
-                _uiState.update { it.copy(
-                    activeToolCall = ToolCallState(
+                val toolCall = ToolCallState(
+                    toolName = info.toolName,
+                    packageName = info.packageName,
+                    appLabel = appLabel,
+                    appIcon = appIcon,
+                    argumentsJson = info.argumentsJson,
+                    status = info.status,
+                    durationMs = info.durationMillis
+                )
+                // STATUS_PERMISSION_REQUIRED = the service is parked on a
+                // consent gate. Pop the prompt; the UI will call
+                // confirmToolCall() with the user's choice.
+                val pending = if (info.status == 3) {
+                    PendingConsent(
+                        sessionId = info.sessionId,
                         toolName = info.toolName,
                         packageName = info.packageName,
                         appLabel = appLabel,
-                        appIcon = appIcon,
-                        argumentsJson = info.argumentsJson,
-                        status = info.status,
-                        durationMs = info.durationMillis
+                        argumentsJson = info.argumentsJson
                     )
+                } else null
+                _uiState.update { it.copy(
+                    activeToolCall = toolCall,
+                    pendingConsent = pending ?: it.pendingConsent
                 ) }
             }
 
@@ -286,6 +316,10 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
                     val ai = pm.getApplicationInfo(info.packageName, 0)
                     pm.getApplicationLabel(ai).toString() to pm.getApplicationIcon(ai)
                 } catch (e: Exception) { info.packageName to null }
+                // Parse structured "needs_permission" errors so we can
+                // pop the Open-Settings CTA (when BAL blocked our
+                // in-app request activity).
+                val missingPerm = parseNeedsPermission(info.resultJson)
                 _uiState.update { it.copy(
                     activeToolCall = ToolCallState(
                         toolName = info.toolName,
@@ -295,7 +329,11 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
                         argumentsJson = info.argumentsJson,
                         status = info.status,
                         durationMs = info.durationMillis
-                    )
+                    ),
+                    pendingConsent = it.pendingConsent
+                        ?.takeUnless { p -> p.toolName == info.toolName },
+                    pendingPermission = missingPerm
+                        ?.copy(appLabel = appLabel) ?: it.pendingPermission
                 ) }
             }
 
@@ -305,9 +343,8 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
             }
 
             override fun onComplete(fullResponse: String) {
-                conversationHistory.add(
-                    ConversationMessage("assistant", fullResponse)
-                )
+                val asstMsg = ConversationMessage("assistant", fullResponse)
+                conversationHistory.add(asstMsg)
 
                 // Capture the session ID from the session handle
                 currentSession?.let { session ->
@@ -318,7 +355,10 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
                     val ui = current.serverUi ?: parseServerUiFromText(fullResponse)
                     current.copy(
                         isGenerating = false,
-                        streamedText = fullResponse,
+                        // Completed turn moves from the streaming buffer
+                        // into the immutable message log.
+                        streamedText = "",
+                        messages = current.messages + asstMsg,
                         serverUi = ui,
                         activeToolCall = null
                     )
@@ -337,6 +377,37 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         })
     }
 
+    /**
+     * Fires the Android launch Intent for the app the model asked about
+     * via the built-in `launch_app` tool. Fuzzy-matches the requested
+     * name against every installed launchable app's label. On match,
+     * fires [Intent.ACTION_MAIN] with [Intent.FLAG_ACTIVITY_NEW_TASK]
+     * so the app takes foreground. Silent on no match — the user sees
+     * the assistant's next turn ("I couldn't find an app named …").
+     */
+    private fun handleBuiltinLaunchApp(argsJson: String) {
+        val name = try {
+            JSONObject(argsJson).optString("name", "").trim()
+        } catch (e: Exception) { "" }
+        if (name.isEmpty()) return
+        val ctx = getApplication<android.app.Application>()
+        val pm = ctx.packageManager
+        val launcherIntent = android.content.Intent(android.content.Intent.ACTION_MAIN)
+            .addCategory(android.content.Intent.CATEGORY_LAUNCHER)
+        val candidates = pm.queryIntentActivities(launcherIntent, 0)
+        val needle = name.lowercase()
+        val match = candidates.firstOrNull { info ->
+            val label = info.loadLabel(pm).toString().lowercase()
+            label == needle || label.contains(needle) || needle.contains(label)
+        } ?: return
+        val launchIntent = pm.getLaunchIntentForPackage(match.activityInfo.packageName)
+            ?: return
+        launchIntent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            ctx.startActivity(launchIntent)
+        } catch (e: Exception) { /* ignore */ }
+    }
+
     fun cancel() {
         currentSession?.cancel()
         _uiState.update { it.copy(
@@ -351,6 +422,7 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun clearConversation() {
+        activeSessionId?.let { endServiceSession(it) }
         activeSessionId = null
         conversationHistory.clear()
         _uiState.update {
@@ -362,15 +434,115 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun startNewConversation() {
+        activeSessionId?.let { endServiceSession(it) }
         activeSessionId = null
         conversationHistory.clear()
         _uiState.update { it.copy(
             currentScreen = Screen.HOME,
             streamedText = "",
+            messages = emptyList(),
             serverUi = null,
             error = null,
-            activeToolCall = null
+            activeToolCall = null,
+            pendingConsent = null
         ) }
+    }
+
+    // ------------------------------------------------------------------
+    // HITL consent
+    // ------------------------------------------------------------------
+
+    /**
+     * The user picked a consent button. Forwards to the service, which
+     * releases the parked dispatcher and (if ALLOW) proceeds with the
+     * tool invocation. Scope codes: 0=ONCE, 1=SESSION, 2=FOREVER.
+     * Decision codes: 1=ALLOW, 2=DENY.
+     */
+    fun confirmToolCall(decision: Int, scope: Int) {
+        val mgr = llmManager ?: return
+        val pending = _uiState.value.pendingConsent ?: return
+        executor.execute {
+            try {
+                val method = mgr.javaClass.getMethod(
+                    "confirmToolCall",
+                    String::class.java, String::class.java,
+                    Int::class.javaPrimitiveType, Int::class.javaPrimitiveType
+                )
+                method.invoke(mgr, pending.sessionId, pending.toolName, decision, scope)
+            } catch (e: Exception) {
+                // If the wrapper doesn't expose it, go through the raw binder.
+                try {
+                    val field = mgr.javaClass.getDeclaredField("mService").apply { isAccessible = true }
+                    val svc = field.get(mgr)
+                    val m = svc.javaClass.getMethod(
+                        "confirmToolCall",
+                        String::class.java, String::class.java,
+                        Int::class.javaPrimitiveType, Int::class.javaPrimitiveType
+                    )
+                    m.invoke(svc, pending.sessionId, pending.toolName, decision, scope)
+                } catch (e2: Exception) {
+                    // swallow — the service-side 60s timeout will resolve as DENY
+                }
+            }
+        }
+        _uiState.update { it.copy(pendingConsent = null) }
+    }
+
+    /**
+     * Best-effort parse of a tool result JSON to detect the
+     * "needs_permission" protocol. Returns null when the result is a
+     * success, a plain error, or anything we don't recognize.
+     */
+    private fun parseNeedsPermission(json: String?): PendingPermission? {
+        if (json == null || !json.contains("needs_permission")) return null
+        return try {
+            val o = JSONObject(json)
+            if (o.optString("error") != "needs_permission") return null
+            PendingPermission(
+                packageName = o.optString("package", ""),
+                permission = o.optString("permission", ""),
+                appLabel = o.optString("package", "")
+            )
+        } catch (e: JSONException) { null }
+    }
+
+    /**
+     * User tapped "Open settings" on a PendingPermission — fire the
+     * ACTION_APPLICATION_DETAILS_SETTINGS intent for the owning app so
+     * they can grant the perm, then come back.
+     */
+    fun openAppDetailsForPending() {
+        val pending = _uiState.value.pendingPermission ?: return
+        val ctx = getApplication<android.app.Application>()
+        val intent = android.content.Intent(
+            android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+            android.net.Uri.fromParts("package", pending.packageName, null)
+        ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            ctx.startActivity(intent)
+        } catch (e: Exception) { /* no-op */ }
+        _uiState.update { it.copy(pendingPermission = null) }
+    }
+
+    fun dismissPendingPermission() {
+        _uiState.update { it.copy(pendingPermission = null) }
+    }
+
+    private fun endServiceSession(sessionId: String) {
+        val mgr = llmManager ?: return
+        executor.execute {
+            try {
+                val method = mgr.javaClass.getMethod("endSession", String::class.java)
+                method.invoke(mgr, sessionId)
+            } catch (e: Exception) {
+                try {
+                    val field = mgr.javaClass.getDeclaredField("mService").apply { isAccessible = true }
+                    val svc = field.get(mgr)
+                    val m = svc.javaClass.getMethod("endSession", String::class.java)
+                    m.invoke(svc, sessionId)
+                } catch (e2: Exception) { /* best-effort */ }
+            }
+        }
     }
 
     private fun buildConversationJson(): String? {
@@ -490,11 +662,41 @@ data class LauncherUiState(
     val isGenerating: Boolean = false,
     val currentQuery: String = "",
     val streamedText: String = "",
+    /**
+     * Full chat log for the active conversation. Each user turn and
+     * each completed assistant turn is appended as a [ConversationMessage].
+     * The in-flight assistant turn lives in [streamedText] until it
+     * completes, at which point it's appended here and [streamedText]
+     * is cleared.
+     */
+    val messages: List<ConversationMessage> = emptyList(),
     val serverUi: List<UiElement>? = null,
     val activeToolCall: ToolCallState? = null,
+    val pendingConsent: PendingConsent? = null,
+    val pendingPermission: PendingPermission? = null,
     val error: String? = null,
     val availableTools: List<String> = emptyList(),
     val sessions: List<SessionInfo> = emptyList()
+)
+
+/** Consent prompt state surfaced to the UI when a tool requires HITL. */
+data class PendingConsent(
+    val sessionId: String,
+    val toolName: String,
+    val packageName: String,
+    val appLabel: String,
+    val argumentsJson: String
+)
+
+/**
+ * Runtime-permission CTA surfaced when an MCP tool returned
+ * {@code {"error":"needs_permission",...}} — typically because Android
+ * 15 BAL blocked the tool's own permission-request activity.
+ */
+data class PendingPermission(
+    val packageName: String,
+    val permission: String,
+    val appLabel: String
 )
 
 data class SessionInfo(

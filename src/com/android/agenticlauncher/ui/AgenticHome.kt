@@ -64,8 +64,14 @@ private fun HomeScreen(viewModel: LauncherViewModel, uiState: LauncherUiState) {
     Scaffold(
         topBar = {
             HomeTopBar(
+                // "has content" now includes the persisted chat log —
+                // without this the New chat / Clear buttons disappear
+                // as soon as the first turn completes (streamedText is
+                // cleared when onComplete moves the final response into
+                // the messages list).
                 hasContent = uiState.streamedText.isNotEmpty()
-                        || uiState.serverUi != null,
+                        || uiState.serverUi != null
+                        || uiState.messages.isNotEmpty(),
                 hasHistory = uiState.sessions.isNotEmpty(),
                 onHistory = { viewModel.navigateTo(Screen.HISTORY) },
                 onNewChat = { viewModel.startNewConversation() },
@@ -110,6 +116,31 @@ private fun HomeScreen(viewModel: LauncherViewModel, uiState: LauncherUiState) {
                 item { ToolCallIndicator(toolCall) }
             }
 
+            // HITL consent prompt — blocks the tool until the user picks.
+            uiState.pendingConsent?.let { pending ->
+                item {
+                    ConsentPromptCard(
+                        pending = pending,
+                        onDecide = { decision, scope ->
+                            viewModel.confirmToolCall(decision, scope)
+                        }
+                    )
+                }
+            }
+
+            // Runtime-permission CTA — shown when the tool's in-app
+            // requestPermissions was blocked by Android 15 BAL, or the
+            // user declined. Falls back to app-details Settings.
+            uiState.pendingPermission?.let { pending ->
+                item {
+                    PermissionRequiredCard(
+                        pending = pending,
+                        onOpenSettings = { viewModel.openAppDetailsForPending() },
+                        onDismiss = { viewModel.dismissPendingPermission() }
+                    )
+                }
+            }
+
             // Proof-of-life between submit and first token / tool event.
             if (uiState.isGenerating
                     && uiState.streamedText.isEmpty()
@@ -119,6 +150,15 @@ private fun HomeScreen(viewModel: LauncherViewModel, uiState: LauncherUiState) {
                 item { ThinkingCard() }
             }
 
+            // Prior turns in the conversation — user + completed assistant.
+            // Keeps the full chat history on screen instead of every new
+            // message overwriting the previous one.
+            items(uiState.messages) { msg ->
+                ChatMessageBubble(msg)
+            }
+
+            // In-flight assistant turn (tokens streaming before onComplete
+            // commits it into messages and clears streamedText).
             if (uiState.streamedText.isNotEmpty() && uiState.serverUi == null) {
                 item {
                     TextResponseCard(uiState.streamedText, uiState.isGenerating)
@@ -683,5 +723,203 @@ fun ServerText(element: UiElement.Text) {
 fun ServerActionButton(action: UiAction, onAction: (UiAction) -> Unit) {
     Button(onClick = { onAction(action) }, modifier = Modifier.fillMaxWidth()) {
         Text(action.label)
+    }
+}
+
+// ------------------------------------------------------------------
+// HITL consent prompt
+// ------------------------------------------------------------------
+
+/**
+ * Four-button consent sheet shown when an MCP tool declares
+ * {@code mcpRequiresConfirmation} and the user has no persisted grant.
+ *
+ * Decision codes (match HitlConsentStore):
+ *   1 = ALLOW, 2 = DENY
+ * Scope codes:
+ *   0 = ONCE (this call), 1 = SESSION (this chat), 2 = FOREVER
+ * Write-intent tools get FOREVER downgraded to SESSION service-side.
+ */
+@Composable
+fun ConsentPromptCard(
+    pending: PendingConsent,
+    onDecide: (decision: Int, scope: Int) -> Unit
+) {
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.tertiaryContainer
+        ),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                text = "Allow ${pending.appLabel}?",
+                style = MaterialTheme.typography.titleMedium
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = "Wants to run: ${pending.toolName}",
+                style = MaterialTheme.typography.bodyMedium
+            )
+            ConsentArgsBlock(pending.argumentsJson)
+            Spacer(Modifier.height(12.dp))
+            // Allow buttons — three scopes.
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    modifier = Modifier.weight(1f),
+                    onClick = { onDecide(1, 0) }
+                ) { Text("Once", maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                Button(
+                    modifier = Modifier.weight(1f),
+                    onClick = { onDecide(1, 1) }
+                ) { Text("This chat", maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                Button(
+                    modifier = Modifier.weight(1f),
+                    onClick = { onDecide(1, 2) }
+                ) { Text("Always", maxLines = 1, overflow = TextOverflow.Ellipsis) }
+            }
+            Spacer(Modifier.height(8.dp))
+            // Deny — full width, secondary emphasis.
+            OutlinedButton(
+                onClick = { onDecide(2, 0) },
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Deny") }
+        }
+    }
+}
+
+@Composable
+private fun ConsentArgsBlock(argsJson: String) {
+    // Pretty key:value rendering so the user reviews what's actually
+    // being sent to the tool (name, phone, email, …) before approving.
+    val rows = remember(argsJson) {
+        try {
+            val obj = org.json.JSONObject(argsJson)
+            val out = mutableListOf<Pair<String, String>>()
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                out.add(k to obj.optString(k, ""))
+            }
+            out
+        } catch (e: Exception) {
+            listOf("args" to argsJson)
+        }
+    }
+    if (rows.isEmpty()) return
+    Spacer(Modifier.height(8.dp))
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        shape = MaterialTheme.shapes.small,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(8.dp)) {
+            rows.forEach { (k, v) ->
+                Row {
+                    Text(
+                        text = "$k: ",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = v,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Fallback CTA shown when an MCP tool reported
+ * {@code {"error":"needs_permission",…}} — i.e. it couldn't (or
+ * wouldn't) get the runtime permission in-app. The user gets one tap
+ * to the app-details screen where they can toggle the permission on.
+ */
+@Composable
+fun PermissionRequiredCard(
+    pending: PendingPermission,
+    onOpenSettings: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val shortPerm = pending.permission.substringAfterLast('.')
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.errorContainer
+        ),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                text = "$shortPerm permission needed",
+                style = MaterialTheme.typography.titleMedium
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = "${pending.appLabel} needs this permission to continue. Grant it in Settings, then ask again.",
+                style = MaterialTheme.typography.bodyMedium
+            )
+            Spacer(Modifier.height(12.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    modifier = Modifier.weight(1f),
+                    onClick = onOpenSettings
+                ) { Text("Open settings") }
+                OutlinedButton(
+                    modifier = Modifier.weight(1f),
+                    onClick = onDismiss
+                ) { Text("Not now") }
+            }
+        }
+    }
+}
+
+/**
+ * Renders a single entry from the conversation log. User messages get a
+ * primary-tinted bubble right-aligned; assistant messages get a neutral
+ * surface bubble left-aligned. Keeps the whole conversation visible so
+ * successive turns accumulate rather than overwriting.
+ */
+@Composable
+fun ChatMessageBubble(message: ConversationMessage) {
+    val isUser = message.role == "user"
+    val bubbleColor = if (isUser) {
+        MaterialTheme.colorScheme.primaryContainer
+    } else {
+        MaterialTheme.colorScheme.surfaceVariant
+    }
+    val textColor = if (isUser) {
+        MaterialTheme.colorScheme.onPrimaryContainer
+    } else {
+        MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    val roleLabel = if (isUser) "You" else "AAOSP"
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth(0.88f),
+            horizontalAlignment = if (isUser) Alignment.End else Alignment.Start
+        ) {
+            Text(
+                text = roleLabel,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
+            )
+            Surface(
+                color = bubbleColor,
+                shape = MaterialTheme.shapes.medium
+            ) {
+                Text(
+                    text = message.content,
+                    color = textColor,
+                    style = MaterialTheme.typography.bodyLarge,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                )
+            }
+        }
     }
 }
